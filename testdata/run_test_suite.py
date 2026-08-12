@@ -89,6 +89,23 @@ def discover_cases():
             yield (sqlite_path.name, f"replays_batch/{sqlite_path.name}", f"gt_batch/{sqlite_path.stem}.json")
 
 
+def _default_chrome_binary():
+    """If a chromedriver is going to be resolved from PATH (the branch
+    below), pin the browser binary to a matching PATH entry too, instead of
+    letting Selenium Manager silently auto-download a DIFFERENT Chrome
+    version to pair with it. That skew is a real, confirmed footgun here:
+    chromedriver picked up chromium 150.x from PATH while Selenium Manager
+    downloaded Chrome-for-Testing 151.x into ~/.cache/selenium and used that
+    instead - two different browser builds, only one of them actually
+    matching the driver talking to it."""
+    import shutil
+    for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
 def make_driver(browser, args):
     if browser == "chrome":
         from selenium.webdriver.chrome.options import Options
@@ -98,6 +115,17 @@ def make_driver(browser, args):
         opts.add_argument("--disable-gpu")
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
+        if args.chrome_binary:
+            opts.binary_location = args.chrome_binary
+        elif not args.chromedriver:
+            # Neither pinned explicitly - if a system chromedriver exists on
+            # PATH, pin the matching system browser too so the two can't
+            # silently drift apart (see _default_chrome_binary above).
+            import shutil
+            if shutil.which("chromedriver"):
+                default_binary = _default_chrome_binary()
+                if default_binary:
+                    opts.binary_location = default_binary
         service = Service(args.chromedriver) if args.chromedriver else Service()
         return webdriver.Chrome(service=service, options=opts)
 
@@ -162,12 +190,24 @@ def probe_browser(browser, args):
 def run_case(browser, args, label, file_path, gt_path):
     """Runs one (browser, replay) test case. Every attempt gets a brand new
     driver process and always quits it afterward - so a crashed/poisoned
-    browser can never leak into the next case, retry or not."""
+    browser can never leak into the next case, retry or not.
+
+    Retries on a transient-looking failure use a backoff delay, not an
+    immediate retry. Confirmed by direct packet capture that this specific
+    failure mode (Chrome's own client socket sending an RST mid-transfer on
+    a large fetch(), independent of file content, COEP headers, IPv4/IPv6,
+    Selenium vs raw CDP, chrome/chromedriver version match - all ruled out
+    individually) comes and goes with real transient load on the machine
+    running the browsers: the exact same case can fail 100% of attempts for
+    several minutes, then pass 100% cleanly with nothing in this script
+    changed. An immediate retry races against whatever's causing that
+    load; a short delay gives it a chance to actually clear."""
     url = f"{args.base_url}/verify_against_truth.html?file={file_path}&gt={gt_path}"
     t0 = time.time()
     last_err = None
+    max_attempts = args.max_attempts
 
-    for attempt in range(2):  # one retry, only on a crash- or network-flake-like failure
+    for attempt in range(max_attempts):
         driver = None
         try:
             driver = make_driver(browser, args)
@@ -177,17 +217,19 @@ def run_case(browser, args, label, file_path, gt_path):
                 lambda d: d.execute_script("return !!(window.__testResult && window.__testResult.done === true)")
             )
             result = driver.execute_script("return window.__testResult")
-            if not result.get("allPass") and looks_transient(result.get("error")) and attempt == 0:
+            if not result.get("allPass") and looks_transient(result.get("error")) and attempt < max_attempts - 1:
                 last_err = RuntimeError(result.get("error"))
-                continue  # retry once - Selenium's own round-trip was fine, the page's fetch() wasn't
+                time.sleep(args.retry_backoff_s * (attempt + 1))
+                continue
             result["wallMs"] = round((time.time() - t0) * 1000)
             if attempt > 0:
                 result["retried"] = attempt
             return result
         except Exception as e:
             last_err = e
-            if not any(s in str(e).lower() for s in CRASH_SIGNS) or attempt == 1:
+            if not any(s in str(e).lower() for s in CRASH_SIGNS) or attempt == max_attempts - 1:
                 break
+            time.sleep(args.retry_backoff_s * (attempt + 1))
         finally:
             if driver is not None:
                 try:
@@ -236,8 +278,11 @@ def main():
     ap.add_argument("--browsers", default="chrome,firefox,webkit")
     ap.add_argument("--timeout-s", type=int, default=120)
     ap.add_argument("--concurrency-per-browser", type=int, default=3)
+    ap.add_argument("--max-attempts", type=int, default=3, help="attempts per case before giving up on a transient-looking failure (default: 3, i.e. up to 2 retries)")
+    ap.add_argument("--retry-backoff-s", type=float, default=3.0, help="base delay before a retry, multiplied by attempt number (default: 3s, 6s, ...) - gives transient machine load a chance to clear instead of racing it")
     ap.add_argument("--only", default=None, help="substring filter on filename")
     ap.add_argument("--chromedriver", default=None, help="path to chromedriver (default: auto)")
+    ap.add_argument("--chrome-binary", default=None, help="path to chrome/chromium binary (default: auto-paired with chromedriver, see make_driver)")
     ap.add_argument("--geckodriver", default=None, help="path to geckodriver (default: auto)")
     ap.add_argument("--webkitwebdriver", default=None, help="path to WebKitWebDriver (default: PATH)")
     args = ap.parse_args()

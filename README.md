@@ -114,11 +114,9 @@ count-only smoke testing had missed.
 `testdata/run_test_suite.py` automates this across every replay in a batch and every real browser
 engine available for automation on the machine - Chromium (Chrome/Edge/Brave), Firefox (Gecko), and
 WebKit (Safari's engine; real Safari is macOS/iOS-only and can't be driven headlessly, but the same
-engine catches most engine-level bugs) - via [Playwright](https://playwright.dev/).
+engine catches most engine-level bugs) - via [Selenium](https://www.selenium.dev/).
 
 ```bash
-playwright install chromium firefox webkit
-
 # one-time: generate ground truth for a batch of replays
 python3 testdata/ground_truth.py path/to/replay.sqlite 6 testdata/gt_batch/replay.json
 # (or loop it over testdata/replays_batch/*.sqlite -> testdata/gt_batch/*.json)
@@ -128,8 +126,3 @@ python3 testdata/run_test_suite.py          # all discovered replays x all 3 eng
 python3 testdata/run_test_suite.py --only match_substring
 python3 testdata/run_test_suite.py --browsers chromium,firefox
 ```
-
-Replay files themselves are never committed (they're real player data - usernames, chat) and
-`testdata/replays_batch/` and `testdata/gt_batch/` are gitignored; populate them locally from
-whatever `.sqlite` recordings you have (e.g. `Modules/Napoleonic Wars/lua/replays.7z` in a Warband
-install) before running the suite.
